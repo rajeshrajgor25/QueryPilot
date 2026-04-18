@@ -19,13 +19,25 @@ export function getPool(): mysql.Pool {
       database: config.database,
       passwordSet: !!config.password,
     });
-    pool = mysql.createPool(config);
+
+    pool = mysql.createPool({
+      ...config,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+    });
   }
+
   return pool;
 }
 
-export async function executeQuery(sql: string, values?: any[]): Promise<any[]> {
+/* ---------------- Execute Query ---------------- */
+export async function executeQuery(
+  sql: string,
+  values?: any[]
+): Promise<any[]> {
   const connection = await getPool().getConnection();
+
   try {
     const [results] = await connection.execute(sql, values || []);
     return results as any[];
@@ -34,15 +46,18 @@ export async function executeQuery(sql: string, values?: any[]): Promise<any[]> 
   }
 }
 
-export async function getTableSchema(tableName: string): Promise<any> {
+/* ---------------- Schema Helpers ---------------- */
+export async function getTableSchema(
+  tableName: string
+): Promise<any> {
   const query = `
     SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
     ORDER BY ORDINAL_POSITION
   `;
-  const results = await executeQuery(query, [config.database, tableName]);
-  return results;
+
+  return await executeQuery(query, [config.database, tableName]);
 }
 
 export async function getAllTables(): Promise<string[]> {
@@ -51,7 +66,9 @@ export async function getAllTables(): Promise<string[]> {
     FROM INFORMATION_SCHEMA.TABLES
     WHERE TABLE_SCHEMA = ?
   `;
+
   const results = await executeQuery(query, [config.database]);
+
   return (results as any[]).map((row: any) => row.TABLE_NAME);
 }
 
@@ -66,31 +83,113 @@ export async function getDatabaseSchema(): Promise<Record<string, any>> {
   return schema;
 }
 
-export async function validateAndExecuteQuery(sql: string): Promise<any[]> {
-  // Basic validation to prevent dangerous operations
-  const upperSql = sql.toUpperCase().trim();
-  
-  // Block DROP, DELETE, TRUNCATE without explicit confirmation
-  if (
-    upperSql.startsWith('DROP') ||
-    upperSql.startsWith('DELETE') ||
-    upperSql.startsWith('TRUNCATE')
-  ) {
-    throw new Error(
-      'Dangerous query detected. This operation requires explicit user confirmation.'
+/* ---------------- Safe Delete Cascade ---------------- */
+async function handleEmployeeDelete(sql: string): Promise<any[]> {
+  let employeeIds: number[] = [];
+
+  // delete by id
+  const idMatch = sql.match(/WHERE\s+emp_id\s*=\s*(\d+)/i);
+
+  // delete by name
+  const nameMatch = sql.match(/WHERE\s+name\s*=\s*'(.+?)'/i);
+
+  if (idMatch) {
+    employeeIds = [Number(idMatch[1])];
+  } else if (nameMatch) {
+    const rows = await executeQuery(
+      `SELECT emp_id FROM employees WHERE name = ?`,
+      [nameMatch[1]]
+    );
+
+    employeeIds = (rows as any[]).map((row) => row.emp_id);
+  }
+
+  if (employeeIds.length === 0) {
+    return [{ message: 'No employee found', affectedRows: 0 }];
+  }
+
+  for (const empId of employeeIds) {
+    // delete child table records first
+    await executeQuery(
+      `DELETE FROM employee_projects WHERE emp_id = ?`,
+      [empId]
+    );
+
+    await executeQuery(
+      `DELETE FROM sales WHERE emp_id = ?`,
+      [empId]
+    );
+
+    // delete main employee
+    await executeQuery(
+      `DELETE FROM employees WHERE emp_id = ?`,
+      [empId]
     );
   }
 
-  // Allow SELECT, INSERT, UPDATE, SHOW, DESCRIBE
-  if (
-    !upperSql.startsWith('SELECT') &&
-    !upperSql.startsWith('INSERT') &&
-    !upperSql.startsWith('UPDATE') &&
-    !upperSql.startsWith('SHOW') &&
-    !upperSql.startsWith('DESCRIBE')
-  ) {
-    throw new Error('Only SELECT, INSERT, UPDATE queries are allowed.');
+  return [
+    {
+      message: 'Employee deleted successfully',
+      affectedRows: employeeIds.length,
+    },
+  ];
+}
+
+/* ---------------- Validate + Execute ---------------- */
+export async function validateAndExecuteQuery(
+  sql: string,
+  allowDangerous = false
+): Promise<any[]> {
+  const cleanSql = sql.trim();
+  const upperSql = cleanSql.toUpperCase();
+
+  // prevent multiple statements
+  const statements = cleanSql
+    .split(';')
+    .filter((s) => s.trim() !== '');
+
+  if (statements.length > 1) {
+    throw new Error('Multiple SQL statements are not allowed.');
   }
 
-  return executeQuery(sql);
+  // hard block
+  if (
+    upperSql.startsWith('DROP') ||
+    upperSql.startsWith('TRUNCATE')
+  ) {
+    throw new Error('Dangerous query blocked.');
+  }
+
+  // custom delete handling
+  if (upperSql.startsWith('DELETE')) {
+    if (!allowDangerous) {
+      throw new Error(
+        'Dangerous query detected. This operation requires explicit user confirmation.'
+      );
+    }
+
+    // if deleting from employees, cascade manually
+    if (upperSql.startsWith('DELETE FROM EMPLOYEES')) {
+      return await handleEmployeeDelete(cleanSql);
+    }
+
+    // normal delete
+    return await executeQuery(cleanSql);
+  }
+
+  // allow safe queries
+  const allowed =
+    upperSql.startsWith('SELECT') ||
+    upperSql.startsWith('INSERT') ||
+    upperSql.startsWith('UPDATE') ||
+    upperSql.startsWith('SHOW') ||
+    upperSql.startsWith('DESCRIBE');
+
+  if (!allowed) {
+    throw new Error(
+      'Only SELECT, INSERT, UPDATE, DELETE, SHOW, DESCRIBE queries are allowed.'
+    );
+  }
+
+  return await executeQuery(cleanSql);
 }

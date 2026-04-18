@@ -1,17 +1,13 @@
 import { Groq } from 'groq-sdk';
 import { StateGraph, START, END } from '@langchain/langgraph';
-import { getDatabaseSchema, executeQuery, validateAndExecuteQuery } from './db';
+import { getDatabaseSchema, validateAndExecuteQuery } from './db';
 
 let groq: Groq | null = null;
 
 function getGroqClient(): Groq {
   if (!groq) {
     const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      throw new Error(
-        'GROQ_API_KEY is not configured. Please add GROQ_API_KEY to your .env.local file.'
-      );
-    }
+    if (!apiKey) throw new Error('GROQ_API_KEY missing');
     groq = new Groq({ apiKey });
   }
   return groq;
@@ -27,137 +23,223 @@ interface AgentState {
   messages: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
-// Node 1: Parse and understand the user query
-async function parseQueryNode(state: AgentState): Promise<Partial<AgentState>> {
+/* ---------------- Parse ---------------- */
+async function parseQueryNode(
+  state: AgentState
+): Promise<Partial<AgentState>> {
   console.log('[Agent] Parsing user query:', state.userQuery);
-  
-  // Get database schema
+
   const schema = await getDatabaseSchema();
-  
+
   return {
     databaseSchema: schema,
-    messages: [
-      ...state.messages,
-      { role: 'user', content: state.userQuery },
-    ],
+    messages: [...state.messages, { role: 'user', content: state.userQuery }],
   };
 }
 
-// Node 2: Generate SQL query using Groq
-async function generateSQLNode(state: AgentState): Promise<Partial<AgentState>> {
+/* ---------------- Generate SQL ---------------- */
+async function generateSQLNode(
+  state: AgentState
+): Promise<Partial<AgentState>> {
   console.log('[Agent] Generating SQL query');
 
-  const schemaDescription = Object.entries(state.databaseSchema || {})
-    .map(([table, columns]: [string, any]) => {
-      const columnList = (columns as any[])
-        .map(
-          (col: any) =>
-            `${col.COLUMN_NAME} (${col.DATA_TYPE}${col.IS_NULLABLE === 'NO' ? ' NOT NULL' : ''})`
-        )
-        .join(', ');
-      return `Table: ${table}\n  Columns: ${columnList}`;
-    })
-    .join('\n\n');
+  const user = state.userQuery.trim();
+  const lower = user.toLowerCase();
 
-  const systemPrompt = `You are an expert SQL query generator. Your task is to convert natural language queries into SQL.
+  let generatedSQL = '';
+
+  /* ========= DELETE FIRST ========= */
+  if (
+    lower.startsWith('delete employee') ||
+    lower.startsWith('delete emp')
+  ) {
+    // delete by id
+    const idMatch = user.match(/\bid\s+(\d+)/i);
+
+    if (idMatch) {
+      generatedSQL = `DELETE FROM employees WHERE emp_id = ${Number(
+        idMatch[1]
+      )};`;
+    } else {
+      let name = user
+        .replace(/delete/gi, '')
+        .replace(/employee/gi, '')
+        .replace(/emp/gi, '')
+        .replace(/name/gi, '')
+        .replace(/detail/gi, '')
+        .replace(/details/gi, '')
+        .replace(/record/gi, '')
+        .replace(/data/gi, '')
+        .replace(/info/gi, '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .replace(/'/g, "''");
+
+      if (!name) {
+        generatedSQL =
+          `SELECT 'Please provide employee id or name' AS message;`;
+      } else {
+        generatedSQL = `DELETE FROM employees WHERE name = '${name}';`;
+      }
+    }
+  }
+
+  /* ========= SHOW EMPLOYEES ========= */
+  else if (
+    lower.includes('show employee') ||
+    lower.includes('all employee') ||
+    lower.includes('employee list') ||
+    lower === 'show employee'
+  ) {
+    generatedSQL = `
+SELECT
+  e.emp_id,
+  e.name,
+  e.age,
+  d.dept_name AS department,
+  e.salary,
+  e.email,
+  e.join_date
+FROM employees e
+JOIN departments d ON e.department_id = d.dept_id;
+`;
+  }
+
+  /* ========= AI FALLBACK ========= */
+  else {
+    const schemaDescription = Object.entries(state.databaseSchema || {})
+      .map(([table, columns]: [string, any]) => {
+        const cols = (columns as any[])
+          .map((col: any) => `${col.COLUMN_NAME} (${col.DATA_TYPE})`)
+          .join(', ');
+        return `Table: ${table}\nColumns: ${cols}`;
+      })
+      .join('\n\n');
+
+    const systemPrompt = `
+You are an expert SQL generator.
 
 Database Schema:
 ${schemaDescription}
 
 Rules:
-1. Always return ONLY the SQL query, no explanations
-2. Use proper SQL syntax for MySQL
-3. Format the SQL for readability
-4. Do not include comments in the SQL
-5. Do not suggest DROP, DELETE, or TRUNCATE operations
+1. Return ONLY one SQL query
+2. No markdown
+3. No explanation
+4. No comments
+5. Use MySQL syntax
+6. Never generate multiple statements
+`;
 
-Generate a SQL query that answers the user's question.`;
+    const response = await getGroqClient().chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...state.messages,
+      ],
+      temperature: 0.2,
+      max_tokens: 400,
+    });
 
-  const response = await getGroqClient().chat.completions.create({
-    model: 'llama-3.1-8b-instant',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...state.messages,
-    ],
-    temperature: 0.3,
-    max_tokens: 500,
-  });
+    generatedSQL =
+      response.choices[0]?.message?.content
+        ?.replace(/```sql|```/g, '')
+        .trim() || '';
+  }
 
-  const generatedSQL = response.choices[0]?.message?.content || '';
-  const sqlQuery = generatedSQL.replace(/```sql\n?|\n?```/g, '').trim();
-
-  console.log('[Agent] Generated SQL:', sqlQuery);
+  console.log('[Agent] Generated SQL:', generatedSQL);
 
   return {
-    generatedSQL: sqlQuery,
+    generatedSQL: generatedSQL.trim(),
     messages: [
       ...state.messages,
-      { role: 'assistant', content: sqlQuery },
+      { role: 'assistant', content: generatedSQL.trim() },
     ],
   };
 }
 
-// Node 3: Validate SQL query
-async function validateQueryNode(state: AgentState): Promise<Partial<AgentState>> {
+/* ---------------- Validate ---------------- */
+async function validateQueryNode(
+  state: AgentState
+): Promise<Partial<AgentState>> {
   console.log('[Agent] Validating SQL query');
 
-  const sql = state.generatedSQL || '';
-  
-  // Validation checks
+  const sql = (state.generatedSQL || '').trim();
+
   if (!sql) {
     return {
       validationResult: 'error',
-      error: 'Failed to generate SQL query',
+      error: 'Failed to generate SQL',
     };
   }
 
-  const upperSql = sql.toUpperCase();
-  if (
-    upperSql.includes('DROP') ||
-    upperSql.includes('DELETE') ||
-    upperSql.includes('TRUNCATE')
-  ) {
-    return {
-      validationResult: 'dangerous',
-      error: 'The generated query contains dangerous operations (DROP, DELETE, TRUNCATE)',
-    };
-  }
-
-  if (
-    !upperSql.startsWith('SELECT') &&
-    !upperSql.startsWith('INSERT') &&
-    !upperSql.startsWith('UPDATE') &&
-    !upperSql.startsWith('SHOW')
-  ) {
+  const statements = sql.split(';').filter((s) => s.trim() !== '');
+  if (statements.length > 1) {
     return {
       validationResult: 'invalid',
-      error: 'Query must be a SELECT, INSERT, UPDATE, or SHOW query',
+      error: 'Multiple SQL statements are not allowed',
     };
   }
 
-  console.log('[Agent] Query validation passed');
+  const upper = sql.toUpperCase();
+
+  if (upper.includes('DROP') || upper.includes('TRUNCATE')) {
+    return {
+      validationResult: 'dangerous',
+      error: 'Dangerous query blocked',
+    };
+  }
+
+  if (
+    upper.startsWith('SELECT') ||
+    upper.startsWith('INSERT') ||
+    upper.startsWith('UPDATE') ||
+    upper.startsWith('DELETE') ||
+    upper.startsWith('SHOW') ||
+    upper.startsWith('DESCRIBE')
+  ) {
+    console.log('[Agent] Query validation passed');
+    return { validationResult: 'valid' };
+  }
+
   return {
-    validationResult: 'valid',
+    validationResult: 'invalid',
+    error: 'Unsupported query type',
   };
 }
 
-// Node 4: Execute the SQL query
-async function executeQueryNode(state: AgentState): Promise<Partial<AgentState>> {
-  if (state.validationResult !== 'valid') {
-    return state;
-  }
+/* ---------------- Execute ---------------- */
+async function executeQueryNode(
+  state: AgentState
+): Promise<Partial<AgentState>> {
+  if (state.validationResult !== 'valid') return state;
 
   console.log('[Agent] Executing SQL query');
 
   try {
-    const results = await validateAndExecuteQuery(state.generatedSQL || '');
-    console.log('[Agent] Query executed successfully, rows:', results.length);
-    
+    const sql = state.generatedSQL || '';
+
+    const isDelete = sql
+      .trim()
+      .toUpperCase()
+      .startsWith('DELETE');
+
+    const results = await validateAndExecuteQuery(
+      sql,
+      isDelete
+    );
+
+    console.log(
+      '[Agent] Query executed successfully, rows:',
+      results?.length || 0
+    );
+
     return {
       executionResult: results,
     };
   } catch (error) {
     console.error('[Agent] Execution error:', error);
+
     return {
       error: `Execution error: ${(error as Error).message}`,
       executionResult: [],
@@ -165,8 +247,10 @@ async function executeQueryNode(state: AgentState): Promise<Partial<AgentState>>
   }
 }
 
-// Node 5: Format results
-async function formatResultsNode(state: AgentState): Promise<Partial<AgentState>> {
+/* ---------------- Format ---------------- */
+async function formatResultsNode(
+  state: AgentState
+): Promise<Partial<AgentState>> {
   console.log('[Agent] Formatting results');
 
   if (state.error) {
@@ -178,32 +262,26 @@ async function formatResultsNode(state: AgentState): Promise<Partial<AgentState>
     };
   }
 
-  const results = state.executionResult || [];
-  const resultSummary = 
-    results.length === 0
-      ? 'No results found'
-      : `Found ${results.length} result${results.length !== 1 ? 's' : ''}`;
+  const rows = state.executionResult || [];
 
   return {
     messages: [
       ...state.messages,
       {
         role: 'assistant',
-        content: `Query executed successfully. ${resultSummary}`,
+        content: `Query executed successfully. ${rows.length} row(s) affected/fetched.`,
       },
     ],
   };
 }
 
-// Conditional edge function
+/* ---------------- Flow ---------------- */
 function shouldExecute(state: AgentState): string {
-  if (state.validationResult === 'valid') {
-    return 'execute';
-  }
-  return 'format';
+  return state.validationResult === 'valid'
+    ? 'execute'
+    : 'format';
 }
 
-// Build the graph
 export async function buildAgent() {
   const workflow = new StateGraph<AgentState>({
     channels: {
@@ -238,14 +316,13 @@ export async function buildAgent() {
   return workflow.compile();
 }
 
-export async function runQuery(userQuery: string): Promise<AgentState> {
+export async function runQuery(
+  userQuery: string
+): Promise<AgentState> {
   const agent = await buildAgent();
-  
-  const initialState: AgentState = {
+
+  return agent.invoke({
     userQuery,
     messages: [],
-  };
-
-  const result = await agent.invoke(initialState);
-  return result;
+  });
 }
