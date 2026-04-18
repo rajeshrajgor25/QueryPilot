@@ -37,7 +37,7 @@ async function parseQueryNode(
   };
 }
 
-/* ---------------- Generate SQL ---------------- */
+/* Generate SQL  */
 async function generateSQLNode(
   state: AgentState
 ): Promise<Partial<AgentState>> {
@@ -48,7 +48,7 @@ async function generateSQLNode(
 
   let generatedSQL = '';
 
-  /* ========= DELETE FIRST ========= */
+  /*  DELETE FIRST  */
   if (
     lower.startsWith('delete employee') ||
     lower.startsWith('delete emp')
@@ -84,7 +84,7 @@ async function generateSQLNode(
     }
   }
 
-  /* ========= SHOW EMPLOYEES ========= */
+  /*  SHOW EMPLOYEES */
   else if (
     lower.includes('show employee') ||
     lower.includes('all employee') ||
@@ -105,7 +105,7 @@ JOIN departments d ON e.department_id = d.dept_id;
 `;
   }
 
-  /* ========= AI FALLBACK ========= */
+  /*  AI FALLBACK */
   else {
     const schemaDescription = Object.entries(state.databaseSchema || {})
       .map(([table, columns]: [string, any]) => {
@@ -158,7 +158,7 @@ Rules:
   };
 }
 
-/* ---------------- Validate ---------------- */
+/*  Validate  */
 async function validateQueryNode(
   state: AgentState
 ): Promise<Partial<AgentState>> {
@@ -208,7 +208,7 @@ async function validateQueryNode(
   };
 }
 
-/* ---------------- Execute ---------------- */
+/*Execute  */
 async function executeQueryNode(
   state: AgentState
 ): Promise<Partial<AgentState>> {
@@ -247,7 +247,7 @@ async function executeQueryNode(
   }
 }
 
-/* ---------------- Format ---------------- */
+/*  Format  */
 async function formatResultsNode(
   state: AgentState
 ): Promise<Partial<AgentState>> {
@@ -275,7 +275,7 @@ async function formatResultsNode(
   };
 }
 
-/* ---------------- Flow ---------------- */
+/* Flow  */
 function shouldExecute(state: AgentState): string {
   return state.validationResult === 'valid'
     ? 'execute'

@@ -31,7 +31,7 @@ export function getPool(): mysql.Pool {
   return pool;
 }
 
-/* ---------------- Execute Query ---------------- */
+/*  Execute Query  */
 export async function executeQuery(
   sql: string,
   values?: any[]
@@ -46,7 +46,7 @@ export async function executeQuery(
   }
 }
 
-/* ---------------- Schema Helpers ---------------- */
+/*  Schema Helpers  */
 export async function getTableSchema(
   tableName: string
 ): Promise<any> {
@@ -83,14 +83,12 @@ export async function getDatabaseSchema(): Promise<Record<string, any>> {
   return schema;
 }
 
-/* ---------------- Safe Delete Cascade ---------------- */
+/*  Safe Delete Cascade  */
 async function handleEmployeeDelete(sql: string): Promise<any[]> {
   let employeeIds: number[] = [];
 
-  // delete by id
   const idMatch = sql.match(/WHERE\s+emp_id\s*=\s*(\d+)/i);
 
-  // delete by name
   const nameMatch = sql.match(/WHERE\s+name\s*=\s*'(.+?)'/i);
 
   if (idMatch) {
@@ -109,7 +107,6 @@ async function handleEmployeeDelete(sql: string): Promise<any[]> {
   }
 
   for (const empId of employeeIds) {
-    // delete child table records first
     await executeQuery(
       `DELETE FROM employee_projects WHERE emp_id = ?`,
       [empId]
@@ -120,7 +117,6 @@ async function handleEmployeeDelete(sql: string): Promise<any[]> {
       [empId]
     );
 
-    // delete main employee
     await executeQuery(
       `DELETE FROM employees WHERE emp_id = ?`,
       [empId]
@@ -135,7 +131,7 @@ async function handleEmployeeDelete(sql: string): Promise<any[]> {
   ];
 }
 
-/* ---------------- Validate + Execute ---------------- */
+/* Validate + Execute  */
 export async function validateAndExecuteQuery(
   sql: string,
   allowDangerous = false
@@ -152,7 +148,6 @@ export async function validateAndExecuteQuery(
     throw new Error('Multiple SQL statements are not allowed.');
   }
 
-  // hard block
   if (
     upperSql.startsWith('DROP') ||
     upperSql.startsWith('TRUNCATE')
@@ -168,16 +163,13 @@ export async function validateAndExecuteQuery(
       );
     }
 
-    // if deleting from employees, cascade manually
     if (upperSql.startsWith('DELETE FROM EMPLOYEES')) {
       return await handleEmployeeDelete(cleanSql);
     }
 
-    // normal delete
     return await executeQuery(cleanSql);
   }
 
-  // allow safe queries
   const allowed =
     upperSql.startsWith('SELECT') ||
     upperSql.startsWith('INSERT') ||
